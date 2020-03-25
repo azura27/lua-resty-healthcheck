@@ -287,7 +287,12 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader)
     if not ok then
       self:log(ERR, "failed to set initial health status in shm: ", err)
     end
-
+    --check interval
+    local ok, err = self.shm:set(key_for(self.TARGET_DELAY, ip, port, hostname),
+                                 1000)
+    if not ok then
+      self:log(ERR, "failed to set initial target delay in shm: ", err)
+    end
     -- target does not exist, go add it
     target_list[#target_list + 1] = {
       ip = ip,
@@ -425,8 +430,8 @@ function checker:get_target_status(ip, port, hostname)
   if not target then
     return nil, "target not found"
   end
-  return target.internal_health == "healthy"
-      or target.internal_health == "mostly_healthy"
+  return { target.internal_health == "healthy"
+      or target.internal_health == "mostly_healthy", target.delay }
 
 end
 
@@ -517,8 +522,7 @@ end
 -- @param limit the limit after which target status is changed
 -- @param ctr_type the counter to increment, see CTR_xxx constants
 -- @return True if succeeded, or nil and an error message.
-local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_type)
-
+local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_type, delay) --check interval
   -- fail fast on counters that are disabled by configuration
   if limit == 0 then
     return true
@@ -537,6 +541,16 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
   if health_report == current_health then
     -- No need to count successes when internal health is fully "healthy"
     -- or failures when internal health is fully "unhealthy"
+    if delay ~= nil then
+      return locking_target(self, ip, port, hostname,function()
+        local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
+        local ok, err = self.shm:replace(counter_key, delay)
+        if not ok then
+          return nil, err
+        end
+        return true
+      end )
+    end    --check interval add delay update
     return true
   end
 
@@ -544,6 +558,12 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
     local multictr, err = self.shm:incr(counter_key, ctr_type, 0)
     if err then
+      return nil, err
+    end
+    --check interval   change delay num
+    local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
+    local ok, err = self.shm:set(counter_key, delay)
+    if not ok then
       return nil, err
     end
 
@@ -577,6 +597,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       self.shm:set(state_key, INTERNAL_STATES[new_health])
       self:raise_event(self.events[new_health], ip, port, hostname)
+      self:raise_event(self.events[delay], ip, port, hostname)  --check interval
     end
 
     return true
@@ -625,11 +646,11 @@ end
 -- @param hostname (optional) hostname of the target being checked.
 -- @param check (optional) the type of check, either "passive" or "active", default "passive".
 -- @return `true` on success, or `nil + error` on failure.
-function checker:report_success(ip, port, hostname, check)
+function checker:report_success(ip, port, hostname, check, delay)  --check interval
 
   local limit = self.checks[check or "passive"].healthy.successes
 
-  return incr_counter(self, "healthy", ip, port, hostname, limit, CTR_SUCCESS)
+  return incr_counter(self, "healthy", ip, port, hostname, limit, CTR_SUCCESS, delay)
 
 end
 
@@ -648,7 +669,7 @@ end
 -- @param check (optional) the type of check, either "passive" or "active", default "passive".
 -- @return `true` on success, `nil` if the status was ignored (not in active or
 -- passive health check lists) or `nil + error` on failure.
-function checker:report_http_status(ip, port, hostname, http_status, check)
+function checker:report_http_status(ip, port, hostname, http_status, check, delay)    --check interval
   http_status = tonumber(http_status) or 0
 
   local checks = self.checks[check or "passive"]
@@ -667,7 +688,7 @@ function checker:report_http_status(ip, port, hostname, http_status, check)
     return
   end
 
-  return incr_counter(self, status_type, ip, port, hostname, limit, ctr)
+  return incr_counter(self, status_type, ip, port, hostname, limit, ctr, delay)
 
 end
 
@@ -811,7 +832,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   end
 
   sock:settimeout(self.checks.active.timeout * 1000)
-
+  local start_time = ngx.now()   --check start
   local ok
   ok, err = sock:connect(ip, port)
   if not ok then
@@ -821,10 +842,10 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     end
     return self:report_tcp_failure(ip, port, hostname, "connect", "active")
   end
-
+  local delay = ngx.now() - start_time   --TCP check end
   if self.checks.active.type == "tcp" then
     sock:close()
-    return self:report_success(ip, port, hostname, "active")
+    return self:report_success(ip, port, hostname, "active", delay)
   end
 
   if self.checks.active.type == "https" then
@@ -862,7 +883,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     end
     return self:report_tcp_failure(ip, port, hostname, "receive", "active")
   end
-
+  delay = ngx.now() - start_time   --HTTP check end 
   local from, to = re_find(status_line,
                           [[^HTTP/\d+\.\d+\s+(\d+)]],
                           "joi", nil, 1)
@@ -878,7 +899,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
 
   self:log(DEBUG, "Reporting '", hostname, " (", ip, ":", port, ")' (got HTTP ", status, ")")
 
-  return self:report_http_status(ip, port, hostname, status, "active")
+  return self:report_http_status(ip, port, hostname, status, "active", delay)
 end
 
 -- executes a work package (a list of checks) sequentially
@@ -1365,6 +1386,7 @@ function _M.new(opts)
   self.TARGET_LIST_LOCK = SHM_PREFIX .. self.name .. ":target_list_lock"
   self.TARGET_LOCK      = SHM_PREFIX .. self.name .. ":target_lock"
   self.PERIODIC_LOCK    = SHM_PREFIX .. self.name .. ":period_lock:"
+  self.TARGET_DELAY     = SHM_PREFIX .. self.name .. ":delay"  --check interval
   -- prepare constants
   self.EVENT_SOURCE     = EVENT_SOURCE_PREFIX .. " [" .. self.name .. "]"
   self.LOG_PREFIX       = LOG_PREFIX .. "(" .. self.name .. ") "
@@ -1382,8 +1404,11 @@ function _M.new(opts)
       for _, target in ipairs(self.targets) do
         local state_key = key_for(self.TARGET_STATE, target.ip, target.port, target.hostname)
         target.internal_health = INTERNAL_STATES[self.shm:get(state_key)]
-        self:log(DEBUG, "Got initial status ", target.internal_health, " ",
-                        target.hostname, " ", target.ip, ":", target.port)
+        --check interval
+        local delay_key = key_for(self.TARGET_DELAY, target.ip, target.port, target.hostname)
+        target.delay = self.shm:get(delay_key)
+        self:log(DEBUG, "Got initial status ", target.internal_health, " ++ ", target.delay,
+                      "  ",  target.hostname, " ", target.ip, ":", target.port)
         -- fill-in the hash part for easy lookup
         self.targets[target.ip] = self.targets[target.ip] or {}
         self.targets[target.ip][target.port] = self.targets[target.ip][target.port] or {}
