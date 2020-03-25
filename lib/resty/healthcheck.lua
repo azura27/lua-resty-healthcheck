@@ -597,7 +597,6 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       self.shm:set(state_key, INTERNAL_STATES[new_health])
       self:raise_event(self.events[new_health], ip, port, hostname)
-      self:raise_event(self.events[delay], ip, port, hostname)  --check interval
     end
 
     return true
