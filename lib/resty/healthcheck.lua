@@ -544,7 +544,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     if delay ~= nil then
       return locking_target(self, ip, port, hostname,function()
         local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
-        local ok, err = self.shm:replace(counter_key, delay)
+        local ok, err = self.shm:set(delay_key, delay)
         if not ok then
           return nil, err
         end
@@ -562,7 +562,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
     --check interval   change delay num
     local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
-    local ok, err = self.shm:set(counter_key, delay)
+    local ok, err = self.shm:set(delay_key, delay)
     if not ok then
       return nil, err
     end
