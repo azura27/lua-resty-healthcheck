@@ -110,6 +110,7 @@ for _, event in ipairs({
   "mostly_healthy",
   "mostly_unhealthy",
   "clear",
+  "delay",  --check interval
 }) do
   EVENTS[event] = event
 end
@@ -288,8 +289,9 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader)
       self:log(ERR, "failed to set initial health status in shm: ", err)
     end
     --check interval
+    local delay = self.checks.active.timeout * 1000
     local ok, err = self.shm:set(key_for(self.TARGET_DELAY, ip, port, hostname),
-                                 1000)
+                                 delay)
     if not ok then
       self:log(ERR, "failed to set initial target delay in shm: ", err)
     end
@@ -309,6 +311,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader)
 
     -- raise event for our newly added target
     self:raise_event(self.events[internal_health], ip, port, hostname)
+    self:raise_event(self.events.delay, ip, port, hostname, delay)
 
     return true
   end)
@@ -336,6 +339,11 @@ local function clear_target_data_from_shm(self, ip, port, hostname)
     ok, err = self.shm:set(key_for(self.TARGET_COUNTER, ip, port, hostname), nil)
     if not ok then
       self:log(ERR, "failed to clear health counter from shm: ", err)
+    end
+    --check interval
+    ok, err = self.shm:set(key_for(self.TARGET_DELAY, ip, port, hostname), nil)
+    if not ok then
+      self:log(ERR, "failed to clear health delay info from shm: ", err)
     end
 end
 
@@ -430,8 +438,8 @@ function checker:get_target_status(ip, port, hostname)
   if not target then
     return nil, "target not found"
   end
-  return { target.internal_health == "healthy"
-      or target.internal_health == "mostly_healthy", target.delay }
+  return target.internal_health == "healthy"
+      or target.internal_health == "mostly_healthy", target.delay 
 
 end
 
@@ -541,13 +549,15 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
   if health_report == current_health then
     -- No need to count successes when internal health is fully "healthy"
     -- or failures when internal health is fully "unhealthy"
-    if delay ~= nil then
+    if (health_report == "healthy" or health_report == "mostly_healthy") and delay ~= nil then
       return locking_target(self, ip, port, hostname,function()
         local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
         local ok, err = self.shm:set(delay_key, delay)
         if not ok then
           return nil, err
         end
+        self:raise_event(self.events.delay, ip, port, hostname, delay)
+        self:log(WARN, "set delay key:", delay)
         return true
       end )
     end    --check interval add delay update
@@ -562,10 +572,14 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
     --check interval   change delay num
     local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
-    local ok, err = self.shm:set(delay_key, delay)
-    if not ok then
-      return nil, err
+    if delay ~= self.shm:get(delay_key) then
+      local ok, err = self.shm:set(delay_key, delay)
+      if not ok then
+        return nil, err
+      end
+      self:raise_event(self.events.delay, ip, port, hostname, delay)
     end
+    self:log(WARN, "set delay key:", delay)
 
     local ctr = ctr_get(multictr, ctr_type)
 
@@ -618,7 +632,7 @@ end
 -- @param hostname (optional) hostname of the target being checked.
 -- @param check (optional) the type of check, either "passive" or "active", default "passive".
 -- @return `true` on success, or `nil + error` on failure.
-function checker:report_failure(ip, port, hostname, check)
+function checker:report_failure(ip, port, hostname, check, delay)
 
   local checks = self.checks[check or "passive"]
   local limit, ctr_type
@@ -630,7 +644,7 @@ function checker:report_failure(ip, port, hostname, check)
     ctr_type = CTR_HTTP
   end
 
-  return incr_counter(self, "unhealthy", ip, port, hostname, limit, ctr_type)
+  return incr_counter(self, "unhealthy", ip, port, hostname, limit, ctr_type, delay)
 
 end
 
@@ -704,12 +718,12 @@ end
 -- https://github.com/openresty/lua-resty-core/blob/master/lib/ngx/balancer.md#get_last_failure
 -- @param check (optional) the type of check, either "passive" or "active", default "passive".
 -- @return `true` on success, or `nil + error` on failure.
-function checker:report_tcp_failure(ip, port, hostname, operation, check)
+function checker:report_tcp_failure(ip, port, hostname, operation, check, delay)
 
   local limit = self.checks[check or "passive"].unhealthy.tcp_failures
 
   -- TODO what do we do with the `operation` information
-  return incr_counter(self, "unhealthy", ip, port, hostname, limit, CTR_TCP)
+  return incr_counter(self, "unhealthy", ip, port, hostname, limit, CTR_TCP, delay)
 
 end
 
@@ -722,11 +736,11 @@ end
 -- @param hostname (optional) hostname of the target being checked.
 -- @param check (optional) the type of check, either "passive" or "active", default "passive".
 -- @return `true` on success, or `nil + error` on failure.
-function checker:report_timeout(ip, port, hostname, check)
+function checker:report_timeout(ip, port, hostname, check, delay)
 
   local limit = self.checks[check or "passive"].unhealthy.timeouts
 
-  return incr_counter(self, "unhealthy", ip, port, hostname, limit, CTR_TIMEOUT)
+  return incr_counter(self, "unhealthy", ip, port, hostname, limit, CTR_TIMEOUT, delay)
 
 end
 
@@ -780,6 +794,7 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
   local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+  local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
@@ -794,6 +809,14 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
     end
 
     self:raise_event(self.events[health_report], ip, port, hostname)
+
+    local delay = self.checks.active.timeout * 1000
+    self.shm:set(delay_key, delay)
+    if err then
+      return nil, err
+    end
+
+    self:raise_event(self.events.delay, ip, port, hostname, delay)
 
     return true
 
@@ -820,7 +843,6 @@ end
 -- Healthcheck runner
 --============================================================================
 
-
 -- Runs a single healthcheck probe
 function checker:run_single_check(ip, port, hostname, hostheader)
 
@@ -837,11 +859,11 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   if not ok then
     if err == "timeout" then
       sock:close()  -- timeout errors do not close the socket.
-      return self:report_timeout(ip, port, hostname, "active")
+      return self:report_timeout(ip, port, hostname, "active", self.checks.active.timeout * 1000)
     end
-    return self:report_tcp_failure(ip, port, hostname, "connect", "active")
+    return self:report_tcp_failure(ip, port, hostname, "connect", "active", self.checks.active.timeout * 1000)
   end
-  local delay = ngx.now() - start_time   --TCP check end
+  local delay = (ngx.now() - start_time) *1000  --TCP check end
   if self.checks.active.type == "tcp" then
     sock:close()
     return self:report_success(ip, port, hostname, "active", delay)
@@ -854,7 +876,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     if not session then
       sock:close()
       self:log(ERR, "failed SSL handshake with '", hostname, " (", ip, ":", port, ")': ", err)
-      return self:report_tcp_failure(ip, port, hostname, "connect", "active")
+      return self:report_tcp_failure(ip, port, hostname, "connect", "active", self.checks.active.timeout * 1000)
     end
   end
 
@@ -867,9 +889,9 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     self:log(ERR, "failed to send http request to '", hostname, " (", ip, ":", port, ")': ", err)
     if err == "timeout" then
       sock:close()  -- timeout errors do not close the socket.
-      return self:report_timeout(ip, port, hostname, "active")
+      return self:report_timeout(ip, port, hostname, "active", self.checks.active.timeout * 1000)
     end
-    return self:report_tcp_failure(ip, port, hostname, "send", "active")
+    return self:report_tcp_failure(ip, port, hostname, "send", "active", self.checks.active.timeout * 1000)
   end
 
   local status_line
@@ -878,11 +900,11 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     self:log(ERR, "failed to receive status line from '", hostname, " (",ip, ":", port, ")': ", err)
     if err == "timeout" then
       sock:close()  -- timeout errors do not close the socket.
-      return self:report_timeout(ip, port, hostname, "active")
+      return self:report_timeout(ip, port, hostname, "active", self.checks.active.timeout * 1000)
     end
-    return self:report_tcp_failure(ip, port, hostname, "receive", "active")
+    return self:report_tcp_failure(ip, port, hostname, "receive", "active", self.checks.active.timeout * 1000)
   end
-  delay = ngx.now() - start_time   --HTTP check end 
+  delay = (ngx.now() - start_time) * 1000   --HTTP check end 
   local from, to = re_find(status_line,
                           [[^HTTP/\d+\.\d+\s+(\d+)]],
                           "joi", nil, 1)
@@ -1037,7 +1059,7 @@ local function checker_callback(premature, self, health_mode)
 end
 
 -- Event handler callback
-function checker:event_handler(event_name, ip, port, hostname)
+function checker:event_handler(event_name, ip, port, hostname, delay)
 
   local target_found = get_target(self, ip, port, hostname)
 
@@ -1096,6 +1118,25 @@ function checker:event_handler(event_name, ip, port, hostname)
     -- clear local cache
     self.targets = {}
     self:log(DEBUG, "event: local cache cleared")
+  --check interval
+  elseif event_name == self.events.delay then
+    if not target_found then
+      -- it is a new target, must add it first
+      target_found = { ip = ip, port = port, hostname = hostname }
+      self.targets[target_found.ip] = self.targets[target_found.ip] or {}
+      self.targets[target_found.ip][target_found.port] = self.targets[target_found.ip][target_found.port] or {}
+      self.targets[target_found.ip][target_found.port][target_found.hostname or ip] = target_found
+      self.targets[#self.targets + 1] = target_found
+      self:log(DEBUG, "event: target added '", hostname or "", "(", ip, ":", port, ")'")
+    end
+    do
+      local from = target_found.delay
+      local to = delay 
+      self:log(DEBUG, "event: target delay '", hostname or "", "(", ip, ":", port,
+                      ")' from '", from ,
+                      "' to '",   to , "'")
+    end
+    target_found.delay = delay
 
   else
     self:log(WARN, "event: unknown event received '", event_name, "'")
@@ -1116,8 +1157,8 @@ end
 
 
 -- Raises an event for a target status change.
-function checker:raise_event(event_name, ip, port, hostname)
-  local target = { ip = ip, port = port, hostname = hostname }
+function checker:raise_event(event_name, ip, port, hostname, delay)
+  local target = { ip = ip, port = port, hostname = hostname, delay = delay }
   worker_events.post(self.EVENT_SOURCE, event_name, target)
 end
 
@@ -1424,7 +1465,8 @@ function _M.new(opts)
 
     self.ev_callback = function(data, event)
       -- just a wrapper to be able to access `self` as a closure
-      return self:event_handler(event, data.ip, data.port, data.hostname)
+      --check interval
+      return self:event_handler(event, data.ip, data.port, data.hostname, data.delay)
     end
     worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
 
