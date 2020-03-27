@@ -310,8 +310,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader)
     end
 
     -- raise event for our newly added target
-    self:raise_event(self.events[internal_health], ip, port, hostname)
-    self:raise_event(self.events.delay, ip, port, hostname, delay)
+    self:raise_event(self.events[internal_health], ip, port, hostname, delay)
 
     return true
   end)
@@ -550,7 +549,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     -- No need to count successes when internal health is fully "healthy"
     -- or failures when internal health is fully "unhealthy"
     if (health_report == "healthy" or health_report == "mostly_healthy") and delay ~= nil then
-      return locking_target(self, ip, port, hostname,function()
+      return locking_target(self, ip, port, hostname, function()
         local delay_key = key_for(self.TARGET_DELAY, ip, port, hostname)
         local ok, err = self.shm:set(delay_key, delay)
         if not ok then
@@ -605,12 +604,12 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
       new_health = "mostly_healthy"
     elseif current_health == "unhealthy" and bit.band(new_multictr, MASK_SUCCESS) > 0 then
       new_health = "mostly_unhealthy"
-    end
+    end    
 
     if new_health and new_health ~= current_health then
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       self.shm:set(state_key, INTERNAL_STATES[new_health])
-      self:raise_event(self.events[new_health], ip, port, hostname)
+      self:raise_event(self.events[new_health], ip, port, hostname, delay)
     end
 
     return true
@@ -808,15 +807,13 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
       return nil, err
     end
 
-    self:raise_event(self.events[health_report], ip, port, hostname)
-
     local delay = self.checks.active.timeout * 1000
     self.shm:set(delay_key, delay)
     if err then
       return nil, err
     end
 
-    self:raise_event(self.events.delay, ip, port, hostname, delay)
+    self:raise_event(self.events[health_report], ip, port, hostname, delay)
 
     return true
 
@@ -1024,6 +1021,7 @@ local function checker_callback(premature, self, health_mode)
     for _, target in ipairs(targets) do
       local tgt = get_target(self, target.ip, target.port, target.hostname)
       local internal_health = tgt and tgt.internal_health or nil
+      --check interval
       if (health_mode == "healthy" and (internal_health == "healthy" or
                                         internal_health == "mostly_healthy"))
       or (health_mode == "unhealthy" and (internal_health == "unhealthy" or
@@ -1113,6 +1111,7 @@ function checker:event_handler(event_name, ip, port, hostname, delay)
                       "' to '",   to   == "healthy" or to   == "mostly_healthy", "'")
     end
     target_found.internal_health = event_name
+    target_found.delay = delay
 
   elseif event_name == self.events.clear then
     -- clear local cache
@@ -1127,14 +1126,7 @@ function checker:event_handler(event_name, ip, port, hostname, delay)
       self.targets[target_found.ip][target_found.port] = self.targets[target_found.ip][target_found.port] or {}
       self.targets[target_found.ip][target_found.port][target_found.hostname or ip] = target_found
       self.targets[#self.targets + 1] = target_found
-      self:log(DEBUG, "event: target added '", hostname or "", "(", ip, ":", port, ")'")
-    end
-    do
-      local from = target_found.delay
-      local to = delay 
-      self:log(DEBUG, "event: target delay '", hostname or "", "(", ip, ":", port,
-                      ")' from '", from ,
-                      "' to '",   to , "'")
+      self:log(DEBUG, "event: target added in delay event'", hostname or "", "(", ip, ":", port, ")'")
     end
     target_found.delay = delay
 
